@@ -5,10 +5,12 @@
 > Cloning or downloading this repo gives you a folder named
 > `mod-dungeon-clear-addon`. The client will **not** load it under that name —
 > the folder inside `Interface/AddOns/` has to be exactly `DungeonClear` (with
-> `DungeonClear.toc` and `DungeonClear.lua` directly inside it). Rename it after
+> `DungeonClear.toc`, `DungeonClear_Wrath.toc` and `DungeonClear.lua` directly
+> inside it). Rename it after
 > copying. See [Installation](#installation) below.
 
-A simple in-game panel for **World of Warcraft 3.3.5a** that lets you send a
+A simple in-game panel for **World of Warcraft 3.3.5a** and the **3.4.3 Wrath
+Classic** client (through HermesProxy) that lets you send a
 party's bot tank through a dungeon and watch its progress, instead of typing
 chat commands.
 
@@ -45,7 +47,11 @@ for loot, opens doors, and recovers from stalls. With this addon you just press
 
 ## Requirements
 
-- WoW client **3.3.5a** (Wrath of the Lich King).
+- WoW client **3.3.5a** (Wrath of the Lich King), or the **3.4.3** Wrath
+  Classic client connected through [HermesProxy][hermes]. The same folder works
+  on both: 3.3.5a loads `DungeonClear.toc`, 3.4.3 loads `DungeonClear_Wrath.toc`.
+- On 3.4.3, a `mod-dungeon-clear` build that understands the addon's separator
+  handshake (see [HermesProxy / 3.4.3](#hermesproxy--343)).
 - An AzerothCore server running [**`mod-dungeon-clear`**][module] with
   **mod-playerbots**.
 - A playerbots **tank bot** in your party — a normal bot, a random bot, or your
@@ -54,8 +60,8 @@ for loot, opens doors, and recovers from stalls. With this addon you just press
 ## Installation
 
 1. Download or clone this repository.
-2. Copy the `DungeonClear` folder (with `DungeonClear.toc` and `DungeonClear.lua`
-   inside it) into your client's add-on directory:
+2. Copy the `DungeonClear` folder (with `DungeonClear.toc`,
+   `DungeonClear_Wrath.toc` and `DungeonClear.lua` inside it) into your client's add-on directory:
 
    ```
    World of Warcraft/Interface/AddOns/DungeonClear/
@@ -66,6 +72,19 @@ for loot, opens doors, and recovers from stalls. With this addon you just press
    character-select screen (tick "Load out of date AddOns" if the client asks).
 4. Log in. You'll see `DungeonClear Addon loaded. Type /dc to toggle window.` in
    your chat frame.
+
+## HermesProxy / 3.4.3
+
+HermesProxy translates the 3.3.5a server's addon messages for the modern client
+by splitting them on tabs and re-joining the fields with spaces, so the panel
+could never read the server's status and boss-list replies. On a 3.4.3 client
+the addon therefore asks the server (`CMD\tsep\tus`, before its first command)
+to separate fields with the ASCII unit separator (0x1F), which the proxy leaves
+alone. The server remembers that per player, so 3.3.5a and 3.4.3 players can
+share one server. The addon reads both separators.
+
+`/dc debug` toggles a chat trace of every addon message sent and received,
+which tells "the server never got it" apart from "the reply never arrived".
 
 ## Using it
 
@@ -204,3 +223,4 @@ If you'd rather type, every button has a command:
 AGPL-3.0-or-later, inherited from mod-playerbots / mod-dungeon-clear.
 
 [module]: https://github.com/jrad7/mod-dungeon-clear
+[hermes]: https://github.com/WowLegacyCore/HermesProxy

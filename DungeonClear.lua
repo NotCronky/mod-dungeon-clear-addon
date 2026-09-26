@@ -4,6 +4,22 @@
 local AddonName = "DungeonClear"
 local Prefix = "DC"
 
+-- Runs on both the 3.3.5a client and the 3.4.3 Wrath Classic client (through
+-- HermesProxy). The modern engine moved a few 3.3.5a APIs: SetBackdrop needs the
+-- BackdropTemplate mixin, addon messages live under C_ChatInfo, a solid-colour
+-- texture is SetColorTexture, and the group-size API is IsInRaid/IsInGroup.
+-- Every shim below falls back to the 3.3.5a API when the modern one is absent.
+local IsModernClient = C_ChatInfo ~= nil
+local BackdropTemplate = BackdropTemplateMixin and "BackdropTemplate" or nil
+local SendAddonMessage = (C_ChatInfo and C_ChatInfo.SendAddonMessage) or SendAddonMessage
+local RegisterAddonMessagePrefix = (C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix) or RegisterAddonMessagePrefix
+local IsInRaid = IsInRaid or function()
+    return (GetNumRaidMembers() or 0) > 0
+end
+local IsInGroup = IsInGroup or function()
+    return (GetNumRaidMembers() or 0) > 0 or (GetNumPartyMembers() or 0) > 0
+end
+
 -- DB Setup
 DungeonClearDB = DungeonClearDB or {
     visible = false,
@@ -107,7 +123,7 @@ local BuildSettingsFromCache    -- render rows from the cached schema at load
 
 
 -- UI Frame Creation
-local frame = CreateFrame("Frame", "DungeonClearFrame", UIParent)
+local frame = CreateFrame("Frame", "DungeonClearFrame", UIParent, BackdropTemplate)
 frame:SetSize(330, 420)
 frame:SetMovable(true)
 frame:EnableMouse(true)
@@ -161,7 +177,7 @@ end)
 -- can be right for every message.
 local STATUS_H = 131
 local STALL_GAP = 8
-local statusFrame = CreateFrame("Frame", nil, frame)
+local statusFrame = CreateFrame("Frame", nil, frame, BackdropTemplate)
 statusFrame:SetSize(306, STATUS_H)
 statusFrame:SetPoint("TOP", frame, "TOP", 0, -35)
 statusFrame:SetBackdrop({
@@ -533,13 +549,78 @@ end
 -- accepts it (IsDcAddonCommand). Bot commands sent this way still need a tank
 -- bot in the sender's group and are refused server-side with that reason, which
 -- is a truer error than a client-side guess.
-local function SendDcCommand(subCmd, param, silent)
-    local inRaid = GetNumRaidMembers() and GetNumRaidMembers() > 0
-    local inParty = GetNumPartyMembers() and GetNumPartyMembers() > 0
+-- Debug trace (/dc debug): prints every outgoing command with the client's
+-- send result and every incoming DC message, to tell "the server never got it"
+-- apart from "the reply never arrived".
+local function DebugPrint(msg)
+    if DungeonClearDB.debug then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff999999[DC debug]|r " .. string.gsub(msg, "\t", " | "))
+    end
+end
+
+-- Outgoing queue. The 3.4.3 client throttles addon messages per prefix (a small
+-- burst, then about one per second) and silently drops the excess. Pressing On
+-- sends "on" plus one "set" per saved override, which used to use up the burst
+-- so the status/boss requests right after it were lost. Commands are queued and
+-- sent within that budget; a request already waiting is not queued twice.
+local SEND_BURST, SEND_REGEN = 8, 1.0
+local sendQueue, sendTokens = {}, SEND_BURST
+local sendPump = CreateFrame("Frame")
+sendPump:Hide()
+
+local function SendOne(item)
+    local ok, result = pcall(SendAddonMessage, Prefix, item.payload, item.channel, item.target)
+    DebugPrint("send " .. item.channel .. ": " .. item.payload .. " -> " .. tostring(ok and result or ("error " .. tostring(result))))
+    -- Older clients return nothing; newer return true or 0 on success.
+    return ok and (result == nil or result == true or result == 0)
+end
+
+sendPump:SetScript("OnUpdate", function(self, elap)
+    sendTokens = math.min(SEND_BURST, sendTokens + elap * SEND_REGEN)
+    while #sendQueue > 0 and sendTokens >= 1 do
+        local item = table.remove(sendQueue, 1)
+        sendTokens = sendTokens - 1
+        if not SendOne(item) then
+            -- Throttled after all: put it back and wait for the budget to refill.
+            item.tries = (item.tries or 0) + 1
+            if item.tries < 5 then table.insert(sendQueue, 1, item) end
+            sendTokens = 0
+            break
+        end
+    end
+    if #sendQueue == 0 and sendTokens >= SEND_BURST then self:Hide() end
+end)
+
+local function QueueAddonMessage(payload, channel, target)
+    for _, item in ipairs(sendQueue) do
+        if item.payload == payload then
+            item.channel, item.target = channel, target
+            return
+        end
+    end
+    table.insert(sendQueue, { payload = payload, channel = channel, target = target })
+    sendPump:Show()
+end
+
+-- HermesProxy rewrites the tabs between the server's reply fields into spaces
+-- on the way to a 3.4.3 client, so the server must separate them with 0x1F
+-- instead. It does that per player once asked; ask ahead of the first command
+-- of this UI session so its reply already arrives in the right form. A 3.3.5a
+-- client talks to the server directly and keeps tabs.
+local sepRequested = not IsModernClient
+
+local SendDcCommand
+function SendDcCommand(subCmd, param, silent)
+    local inRaid = IsInRaid()
+    local inParty = IsInGroup()
 
     local payload = "CMD\t" .. subCmd
     if param and param ~= "" then
         payload = payload .. "\t" .. tostring(param)
+    end
+    if not sepRequested then
+        sepRequested = true
+        SendDcCommand("sep", "us", true)
     end
 
     if inRaid or inParty then
@@ -547,13 +628,13 @@ local function SendDcCommand(subCmd, param, silent)
         -- own subgroup, so a tank bot in another subgroup never gets the command.
         -- Send on RAID when in a raid so it reaches every subgroup; PARTY covers
         -- the ordinary 5-man case. The server hook accepts both.
-        SendAddonMessage("DC", payload, inRaid and "RAID" or "PARTY")
+        QueueAddonMessage(payload, inRaid and "RAID" or "PARTY")
         return
     end
 
     local me = UnitName("player")
     if me and me ~= "" then
-        SendAddonMessage("DC", payload, "WHISPER", me)
+        QueueAddonMessage(payload, "WHISPER", me)
     elseif not silent and param ~= "addon" then
         DEFAULT_CHAT_FRAME:AddMessage("|cffff3333DungeonClear: cannot send bot commands right now.|r")
     end
@@ -997,7 +1078,7 @@ listLabel:SetText("Dungeon Bosses")
 listLabel:SetTextColor(0.24, 0.60, 1.0)
 
 -- Boss List Scroll Frame container
-local scrollContainer = CreateFrame("Frame", nil, frame)
+local scrollContainer = CreateFrame("Frame", nil, frame, BackdropTemplate)
 scrollContainer:SetSize(306, 205)
 scrollContainer:SetPoint("TOPLEFT", listLabel, "BOTTOMLEFT", 0, -4)
 scrollContainer:SetBackdrop({
@@ -1049,7 +1130,11 @@ for i = 1, VISIBLE_ROWS do
     -- Custom solid color texture instead of SetBackdrop to prevent client crashes
     local bg = row:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(row)
-    bg:SetTexture(0.08, 0.10, 0.15, 0.4)
+    if bg.SetColorTexture then
+        bg:SetColorTexture(0.08, 0.10, 0.15, 0.4)
+    else
+        bg:SetTexture(0.08, 0.10, 0.15, 0.4)
+    end
     row.bg = bg
 
     -- Text label
@@ -1459,9 +1544,38 @@ end)
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("CHAT_MSG_ADDON")
+-- Events that exist on only one of the two clients. The modern client rejects
+-- an unknown event name, so register them guarded.
+local function RegisterOptionalEvent(event)
+    pcall(eventFrame.RegisterEvent, eventFrame, event)
+end
+-- LANG_ADDON_LOGGED traffic on the modern client arrives on its own event.
+RegisterOptionalEvent("CHAT_MSG_ADDON_LOGGED")
+
+-- Fallback transport: if the server's addon packets reach the 3.4.3 client as
+-- ordinary chat (LANG_ADDON is handled differently than on 3.3.5), the lines
+-- arrive as "DC\t..." whispers or system/party text. Parse those and keep them
+-- out of the chat frame.
+local ChatFallbackEvents = {
+    CHAT_MSG_WHISPER = true, CHAT_MSG_SYSTEM = true,
+    CHAT_MSG_PARTY = true, CHAT_MSG_PARTY_LEADER = true,
+    CHAT_MSG_RAID = true, CHAT_MSG_RAID_LEADER = true,
+}
+local function IsDcChatLine(message)
+    return type(message) == "string" and string.find(message, "^" .. Prefix .. "\t") ~= nil
+end
+for event in pairs(ChatFallbackEvents) do
+    eventFrame:RegisterEvent(event)
+    ChatFrame_AddMessageEventFilter(event, function(_, _, message)
+        return IsDcChatLine(message)
+    end)
+end
 eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+-- Group changes: GROUP_ROSTER_UPDATE on 3.4.3, the two older events on 3.3.5a.
+RegisterOptionalEvent("GROUP_ROSTER_UPDATE")
+RegisterOptionalEvent("PARTY_MEMBERS_CHANGED")
+RegisterOptionalEvent("RAID_ROSTER_UPDATE")
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 -- Corrective only, for the camera state the addon models from its own commands:
@@ -1512,12 +1626,25 @@ frame:SetScript("OnUpdate", OnUpdateHandler)
 
 -- Addon Messages parsing
 local function OnAddonMessage(prefix, message, channel, sender)
-    if prefix ~= "DC" then return end
-    
+    if not message then return end
+    if prefix ~= Prefix then
+        -- A server that still builds 3.3.5-style packets puts the prefix inside
+        -- the text ("DC\tSTATUS\t...") and leaves the 3.4.3 prefix field empty
+        -- or holding the whole thing. Accept that form too.
+        local full = (prefix or "") .. message
+        local body = string.match(full, "^" .. Prefix .. "\t(.*)$")
+        if not body then return end
+        message = body
+    end
+    DebugPrint("recv " .. tostring(channel) .. ": " .. message)
+
+    -- Fields are tab-separated from a 3.3.5a client, or 0x1F-separated when the
+    -- server runs DungeonClear.AddonHermesCompat = 1: HermesProxy turns tabs
+    -- into spaces on the way to a 3.4.3 client, but leaves 0x1F alone.
     local parts = {}
     local start = 1
     while true do
-        local pos = string.find(message, "\t", start)
+        local pos = string.find(message, "[\t\031]", start)
         if not pos then
             table.insert(parts, string.sub(message, start))
             break
@@ -1671,15 +1798,26 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
                 frame:Hide()
             end
             
-            -- WotLK addon message prefix registration (only needed/exists in 4.1+)
+            -- Required on the 3.4.3 client: CHAT_MSG_ADDON only delivers
+            -- registered prefixes (C_ChatInfo.RegisterAddonMessagePrefix).
+            -- 3.3.5a has no such API and delivers every prefix.
             if RegisterAddonMessagePrefix then
                 RegisterAddonMessagePrefix(Prefix)
             end
         end
-    elseif event == "CHAT_MSG_ADDON" then
+    elseif event == "CHAT_MSG_ADDON" or event == "CHAT_MSG_ADDON_LOGGED" then
         local prefix, message, channel, sender = ...
+        if DungeonClearDB.debug and prefix ~= Prefix then
+            DebugPrint("other addon msg [" .. tostring(prefix) .. "] " .. tostring(channel) .. ": " .. tostring(message))
+        end
         OnAddonMessage(prefix, message, channel, sender)
-    elseif event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" or event == "GROUP_ROSTER_UPDATE" then
+    elseif ChatFallbackEvents[event] then
+        local message, sender = ...
+        if IsDcChatLine(message) then
+            OnAddonMessage("", message, event, sender)
+        end
+    elseif event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" or event == "GROUP_ROSTER_UPDATE"
+            or event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         local inInstance, instanceType = IsInInstance()
 
         -- Did we cross into a *different* instance since the list was built? If
@@ -1755,6 +1893,23 @@ end)
 -- the floating window.
 local optionsPanel = CreateFrame("Frame", "DungeonClearOptionsPanel", UIParent)
 optionsPanel.name = "DungeonClear"
+optionsPanel:Hide()
+
+-- Register an options page with whichever settings UI this client has: the
+-- Settings API (newer Classic builds) or the legacy InterfaceOptions frame.
+-- `parentCategory` is the value returned when the parent page was registered.
+local function RegisterOptionsPanel(panel, parentCategory)
+    if Settings and Settings.RegisterCanvasLayoutCategory then
+        if parentCategory then
+            return Settings.RegisterCanvasLayoutSubcategory(parentCategory, panel, panel.name)
+        end
+        local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
+        Settings.RegisterAddOnCategory(category)
+        return category
+    end
+    InterfaceOptions_AddCategory(panel)
+    return panel
+end
 
 local optTitle = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 optTitle:SetPoint("TOPLEFT", optionsPanel, "TOPLEFT", 16, -16)
@@ -1820,7 +1975,7 @@ openBtn:SetScript("OnClick", function()
     frame:Show()
 end)
 
-InterfaceOptions_AddCategory(optionsPanel)
+local optionsCategory = RegisterOptionsPanel(optionsPanel)
 
 -- ===========================================================================
 -- Settings sub-panel (Interface -> AddOns -> DungeonClear -> Settings)
@@ -1943,6 +2098,12 @@ local settingRows = {}     -- key -> row frame
 local settingOrder = {}    -- insertion order for layout
 local inSyncBatch = false
 
+-- OptionsSliderTemplate's caption/min/max labels: parentKey on the modern
+-- engine, named globals ($parentText/Low/High) on older templates.
+local function SliderPart(slider, part)
+    return slider[part] or _G[slider:GetName() .. part]
+end
+
 local function StepFor(stype) return stype == DCT_FLOAT and 0.5 or 1 end
 
 local function RoundVal(stype, v)
@@ -1961,6 +2122,7 @@ end
 local settingsPanel = CreateFrame("Frame", "DungeonClearSettingsPanel", UIParent)
 settingsPanel.name = "Settings"
 settingsPanel.parent = optionsPanel.name  -- nests under "DungeonClear"
+settingsPanel:Hide()
 
 local setTitle = settingsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 setTitle:SetPoint("TOPLEFT", settingsPanel, "TOPLEFT", 16, -16)
@@ -2113,7 +2275,10 @@ local function CreateSettingRow(key, stype)
         s:SetWidth(300)
         s:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 10, 2)
         s:SetOrientation("HORIZONTAL")
-        getglobal(s:GetName() .. "Text"):SetText("")  -- use our own label instead
+        local caption = SliderPart(s, "Text")
+        if caption then caption:SetText("") end  -- use our own label instead
+        -- Modern sliders don't snap to the step while dragging unless asked.
+        if s.SetObeyStepOnDrag then s:SetObeyStepOnDrag(true) end
         row.valText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         row.valText:SetPoint("LEFT", s, "RIGHT", 14, 0)
         row.valText:SetTextColor(1, 0.82, 0)
@@ -2164,8 +2329,9 @@ local function UpsertSetting(key, value, minV, maxV, stype, overridden)
     else
         row.control:SetMinMaxValues(minV, maxV)
         row.control:SetValueStep(StepFor(stype))
-        getglobal(row.control:GetName() .. "Low"):SetText(FmtVal(stype, minV))
-        getglobal(row.control:GetName() .. "High"):SetText(FmtVal(stype, maxV))
+        local low, high = SliderPart(row.control, "Low"), SliderPart(row.control, "High")
+        if low then low:SetText(FmtVal(stype, minV)) end
+        if high then high:SetText(FmtVal(stype, maxV)) end
         row.control:SetValue(value)
         row.valText:SetText(FmtVal(stype, value))
     end
@@ -2249,7 +2415,7 @@ end
 settingsPanel.refresh = RefreshSettings
 settingsPanel:SetScript("OnShow", RefreshSettings)
 
-InterfaceOptions_AddCategory(settingsPanel)
+RegisterOptionsPanel(settingsPanel, optionsCategory)
 
 -- Minimap Button
 -- Self-contained (no LibDBIcon dependency): a draggable button pinned to the
@@ -2345,6 +2511,10 @@ SlashCmdList["DUNGEONCLEAR"] = function(msg)
             UpdateLayout()
             frame:Show()
         end
+    elseif msg == "debug" then
+        -- Client-side only: trace addon traffic in chat. Never sent to the server.
+        DungeonClearDB.debug = not DungeonClearDB.debug
+        DEFAULT_CHAT_FRAME:AddMessage("|cff3da6ffDungeonClear:|r debug trace " .. (DungeonClearDB.debug and "ON" or "OFF"))
     else
         -- Parse "/dc <sub> [param]" and send via addon message
         local subCmd, param = msg:match("^(%S+)%s*(.*)$")
